@@ -1,0 +1,108 @@
+# Релиз: пуш тега `vX.Y.Z` гоняет тесты, затем публикует образ на
+# Docker Hub (<user>/datapulse:X.Y.Z + latest) и создаёт GitHub Release.
+#
+# Секреты репозитория: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the tag matches __version__
+        run: |
+          VERSION=$(grep -oP '__version__ = "\K[^"]+' src/datapulse/__init__.py)
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$VERSION" != "$TAG_VERSION" ]; then
+            echo "Тег $GITHUB_REF_NAME не совпадает с __version__ $VERSION" >&2
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: pip install "psycopg[binary]>=3.2" "cryptography>=45" "oracledb>=3" pytest
+
+      - name: Run the test suite
+        env:
+          PG_HOST: 127.0.0.1
+          PG_PORT: "5432"
+          PG_USER: postgres
+          PG_PASSWORD: postgres
+        run: python -m pytest tests -q
+
+  docker:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Derive the version from the tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push the image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/datapulse:${{ env.VERSION }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/datapulse:latest
+
+  # Страница репо на Docker Hub: README как описание. Не блокирует релиз.
+  dockerhub-description:
+    needs: docker
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: peter-evans/dockerhub-description@v5
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ secrets.DOCKERHUB_USERNAME }}/datapulse
+          short-description: "ELT-платформа: pgwire-прокси-расширение над Postgres"
+          readme-filepath: ./README.md
+
+  release:
+    needs: docker
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "DataPulse $GITHUB_REF_NAME" \
+            --generate-notes

@@ -1,0 +1,12 @@
+.git/
+.github/
+.gitignore
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+tests/
+docs/
+CLAUDE.md
+Dockerfile
+.dockerignore

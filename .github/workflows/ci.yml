@@ -1,0 +1,42 @@
+# CI: юниты + e2e против сервис-контейнера Postgres.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: pip install "psycopg[binary]>=3.2" "cryptography>=45" "oracledb>=3" pytest
+
+      - name: Run the test suite
+        env:
+          PG_HOST: 127.0.0.1
+          PG_PORT: "5432"
+          PG_USER: postgres
+          PG_PASSWORD: postgres
+        run: python -m pytest tests -q
+
+      - name: Build the image
+        run: docker build -t datapulse:ci .
