@@ -46,12 +46,21 @@ from .dpl import (
     CreateConnection,
     CreateDatapulse,
     CreateDataset,
+    CreateFlowSpec,
     DatasetAttr,
     DplError,
     DropBuildSpec,
     DropDataset,
+    DropFlowSpec,
     FixCall,
+    FlowAttachCall,
+    FlowCall,
+    FlowPauseCall,
+    FlowResumeCall,
+    FlowStopCall,
+    MART_TRANSFER_TYPES,
     PythonBlock,
+    STORE_TRANSFER_TYPES,
     SqlState,
     StopCall,
     TestConnection,
@@ -134,6 +143,21 @@ async def execute(
             return await engine.stop_build(database, user_code, command)
         if isinstance(command, FixCall):
             return await engine.fix_build(database, user_code, command)
+        if isinstance(command, FlowCall):
+            flow_id = await engine.start_flow(database, user_code, command)
+            return TableResult(
+                tag="FLOW",
+                columns=[("flow_id", INT8_OID)],
+                rows=[[str(flow_id)]],
+            )
+        if isinstance(command, FlowAttachCall):
+            return await engine.attach_flow(database, command, notify, run)
+        if isinstance(command, FlowStopCall):
+            return await engine.stop_flow(database, user_code, command)
+        if isinstance(command, FlowPauseCall):
+            return await engine.pause_flow(database, user_code, command)
+        if isinstance(command, FlowResumeCall):
+            return await engine.resume_flow(database, user_code, command)
         async with await _connect(config, database) as conn:
             cur = conn.cursor()
             if isinstance(command, CreateDatapulse):
@@ -160,6 +184,10 @@ async def execute(
                 return await _test_connection(cur, command, config)
             if isinstance(command, AlterDatapulseAdd):
                 return await _alter_datapulse_add(cur, command, user_code, src)
+            if isinstance(command, CreateFlowSpec):
+                return await _create_flow_spec(cur, command, user_code, src)
+            if isinstance(command, DropFlowSpec):
+                return await _drop_flow_spec(cur, command, user_code, src)
             return await _drop(cur)
     except (DplError, psycopg.Error):
         raise
@@ -340,11 +368,12 @@ async def _insert_version(
 
 async def _current_dataset(
     cur, dataset_code: str
-) -> tuple[int, bool, str | None] | None:
-    """Последняя версия датасета (version_id, is_deleted, descr);
-    None — версий не было."""
+) -> tuple[int, bool, str | None, str] | None:
+    """Последняя версия датасета (version_id, is_deleted, descr,
+    type_code); None — версий не было."""
     await cur.execute(
-        "select version_id, is_deleted, descr from datapulse.dataset"
+        "select version_id, is_deleted, descr, type_code"
+        " from datapulse.dataset"
         " where dataset_code = %s order by version_id desc limit 1",
         (dataset_code,),
     )
@@ -353,8 +382,9 @@ async def _current_dataset(
 
 async def _require_live_dataset(
     cur, dataset_code: str, pos: int
-) -> tuple[int, bool, str | None]:
-    """Живой датасет обязателен: (version_id, is_deleted=False, descr)."""
+) -> tuple[int, bool, str | None, str]:
+    """Живой датасет обязателен: (version_id, is_deleted=False, descr,
+    type_code)."""
     current = await _current_dataset(cur, dataset_code)
     if current is None or current[1]:
         raise DplError(
@@ -370,14 +400,15 @@ async def _insert_dataset(
     version_id: int,
     dataset_code: str,
     *,
+    type_code: str,
     is_deleted: bool,
     descr: str | None,
 ) -> None:
     await cur.execute(
         "insert into datapulse.dataset"
-        " (version_id, dataset_code, is_deleted, descr)"
-        " values (%s, %s, %s, %s)",
-        (version_id, dataset_code, is_deleted, descr),
+        " (version_id, dataset_code, type_code, is_deleted, descr)"
+        " values (%s, %s, %s, %s, %s)",
+        (version_id, dataset_code, type_code, is_deleted, descr),
     )
 
 
@@ -425,7 +456,15 @@ async def _create_dataset(cur, command: CreateDataset, user_code: str, src: str)
             f"датасет {command.dataset_code!r} уже существует",
             pos=command.code_pos,
             sqlstate=SqlState.DUPLICATE_OBJECT,
-            hint="заменить — create or replace dataset",
+            hint=f"заменить — create or replace {command.type_code} dataset",
+        )
+    if alive and current[3] != command.type_code:
+        raise DplError(
+            f"датасет {command.dataset_code!r} — {current[3]}: смена"
+            " подкласса через or replace запрещена",
+            pos=command.code_pos,
+            hint="смена рода — drop dataset, затем create",
+            sqlstate=SqlState.FEATURE_NOT_SUPPORTED,
         )
     # комментарии датасета и атрибутов переживают or replace (семантика
     # Postgres); сопоставление атрибутов — по имени
@@ -442,14 +481,17 @@ async def _create_dataset(cur, command: CreateDataset, user_code: str, src: str)
     await _insert_version(
         cur, version_id,
         user_code=user_code,
-        command="create or replace dataset" if command.or_replace
-        else "create dataset",
+        command=(
+            f"create or replace {command.type_code} dataset"
+            if command.or_replace else f"create {command.type_code} dataset"
+        ),
         src=src,
         usage=usage,
         descr=dp_descr,
     )
     await _insert_dataset(
-        cur, version_id, command.dataset_code, is_deleted=False, descr=ds_descr
+        cur, version_id, command.dataset_code,
+        type_code=command.type_code, is_deleted=False, descr=ds_descr,
     )
     await _insert_dataset_attrs(
         cur, version_id, command.dataset_code,
@@ -459,8 +501,9 @@ async def _create_dataset(cur, command: CreateDataset, user_code: str, src: str)
             for order_num, attr in enumerate(command.attrs, start=1)
         ],
     )
-    await _create_dataset_function(
-        cur, command.dataset_code, command.attrs, live_specs, ds_descr
+    await _create_dataset_view(
+        cur, command.dataset_code, command.attrs, live_specs, ds_descr,
+        {attr.name: attr_descr.get(attr.name) for attr in command.attrs},
     )
     return "CREATE DATASET"
 
@@ -498,8 +541,8 @@ def _check_live_specs_diff(command: CreateDataset, old: list[tuple]) -> None:
         )
 
 
-def _function_columns(attrs) -> list[tuple[str, str]]:
-    """Колонки функции датасета — порядок спековой таблицы донора:
+def _view_columns(attrs) -> list[tuple[str, str]]:
+    """Колонки вьюхи датасета — порядок спековой таблицы донора:
     ключевые атрибуты, служебные SCD2, неключевые атрибуты."""
     pk = [a for a in attrs if a.is_primary]
     non_pk = [a for a in attrs if not a.is_primary]
@@ -512,34 +555,31 @@ def _function_columns(attrs) -> list[tuple[str, str]]:
     )
 
 
-async def _create_dataset_function(
+async def _create_dataset_view(
     cur,
     dataset_code: str,
     attrs,
     spec_nums: list[int],
     descr: str | None,
+    attr_descrs: dict[str, str | None] | None = None,
 ) -> None:
-    """Табличная функция датасета `схема.имя(build_id bigint default null)`
-    — union all по основным таблицам живых спек.
+    """Вьюха датасета `схема.имя` — union all по основным таблицам живых
+    спек, без параметров и фильтров.
 
-    Параметр — срез «на момент билда» (включительно): при null строки
-    отдаются все, включая закрытые версии; ссылка на параметр в теле —
-    $1 (колонка build_id перекрывает имя). Без спек тело пустое
+    Вьюха отдаёт сырую историю «как есть» (включая недоехавшие билды):
+    консистентные срезы обеспечиваются окнами дельт билдов, а
+    потребительский as-of выражается по колонкам build_id/end_build_id;
+    защитные вьюхи и права — следующие итерации. Без спек тело пустое
     (нуль строк правильных типов). Состав колонок при or replace
-    датасета меняется, а create or replace function менять его не
-    умеет — поэтому drop + create; комментарий датасета накатывается
-    на функцию заново.
+    датасета меняется, а create or replace view сузить или переставить
+    колонки не умеет — поэтому drop + create; комментарии датасета и
+    атрибутов накатываются заново.
     """
-    columns = _function_columns(attrs)
-    returns = ", ".join(f"{name} {type_code}" for name, type_code in columns)
+    columns = _view_columns(attrs)
     if spec_nums:
         names = "\n     , ".join(name for name, _ in columns)
         body = "\nunion all\n".join(
-            f"select {names}\n"
-            f"  from {dataset_code}_{num}\n"
-            f" where $1 is null\n"
-            f"    or (build_id <= $1"
-            f" and (end_build_id is null or end_build_id >= $1))"
+            f"select {names}\n  from {dataset_code}_{num}"
             for num in sorted(spec_nums)
         )
     else:
@@ -547,30 +587,33 @@ async def _create_dataset_function(
             f"null::{type_code} as {name}" for name, type_code in columns
         )
         body = f"select {nulls}\n where false"
-    await _drop_dataset_function(cur, dataset_code)
-    await cur.execute(
-        f"create function {dataset_code}(build_id bigint default null)\n"
-        f"returns table ({returns})\n"
-        f"language sql stable\n"
-        f"as $$\n{body}\n$$"
-    )
+    await _drop_dataset_view(cur, dataset_code)
+    await cur.execute(f"create view {dataset_code} as\n{body}")
+    # чтение открыто временно, до ролевой модели (как таблицы спек)
+    await cur.execute(f"grant select on {dataset_code} to public")
     if descr is not None:
-        await _comment_dataset_function(cur, dataset_code, descr)
+        await _comment_dataset_view(cur, dataset_code, descr)
+    for column, comment in _SYS_COLUMN_COMMENTS.items():
+        await cur.execute(
+            f"comment on column {dataset_code}.{column} is %s", (comment,)
+        )
+    for name, comment in (attr_descrs or {}).items():
+        if comment is not None:
+            await cur.execute(
+                f"comment on column {dataset_code}.{name} is %s", (comment,)
+            )
 
 
-async def _drop_dataset_function(cur, dataset_code: str) -> None:
-    await cur.execute(f"drop function if exists {dataset_code}(bigint)")
+async def _drop_dataset_view(cur, dataset_code: str) -> None:
+    await cur.execute(f"drop view if exists {dataset_code}")
 
 
-async def _comment_dataset_function(
+async def _comment_dataset_view(
     cur, dataset_code: str, descr: str | None
 ) -> None:
-    """Комментарий датасета дублируется на его функцию (comment on
-    function); комментарии атрибутов на колонки функции не ложатся —
-    Postgres не комментирует колонки результата функций."""
-    await cur.execute(
-        f"comment on function {dataset_code}(bigint) is %s", (descr,)
-    )
+    """Комментарий датасета дублируется на его вьюху (comment on view);
+    комментарии атрибутов ложатся на её колонки."""
+    await cur.execute(f"comment on view {dataset_code} is %s", (descr,))
 
 
 async def _drop_dataset(cur, command: DropDataset, user_code: str, src: str) -> str:
@@ -596,8 +639,8 @@ async def _drop_dataset(cur, command: DropDataset, user_code: str, src: str) -> 
             hint="сначала удалите или переведите спеки-читатели",
             sqlstate=SqlState.DEPENDENT_OBJECTS,
         )
-    # tombstone-версия: копирует поля предыдущей версии (descr),
-    # детей (атрибутов) не имеет
+    # tombstone-версия: копирует поля предыдущей версии (descr,
+    # type_code), детей (атрибутов) не имеет
     version_id = last_version + 1
     await _insert_version(
         cur, version_id,
@@ -609,9 +652,9 @@ async def _drop_dataset(cur, command: DropDataset, user_code: str, src: str) -> 
     )
     await _insert_dataset(
         cur, version_id, command.dataset_code,
-        is_deleted=True, descr=current[2],
+        type_code=current[3], is_deleted=True, descr=current[2],
     )
-    await _drop_dataset_function(cur, command.dataset_code)
+    await _drop_dataset_view(cur, command.dataset_code)
     return "DROP DATASET"
 
 
@@ -800,6 +843,17 @@ async def _create_build_spec(
     dataset = await _require_live_dataset(
         cur, command.dataset_code, command.code_pos
     )
+    dataset_type = dataset[3]
+    _check_spec_modes(command, dataset_type)
+    if dataset_type == "store" and command.using and command.sources:
+        raise DplError(
+            "USING и FROM взаимоисключающи у store-спеки: она — загрузчик"
+            " либо трансформер",
+            pos=command.code_pos,
+            hint="оба сразу — только у витринной спеки (from — сторы,"
+            " using — коннекты отгрузки)",
+            sqlstate=SqlState.INVALID_PARAMETER_VALUE,
+        )
     attrs = await _dataset_attrs(cur, command.dataset_code, dataset[0])
     pk = {attr[0] for attr in attrs if attr[3]}
     if chunk_attr.value.text not in pk:
@@ -824,6 +878,13 @@ async def _create_build_spec(
                 f"датасет-источник {named.name!r} не существует",
                 pos=named.pos,
                 sqlstate=SqlState.UNDEFINED_OBJECT,
+            )
+        if source[3] == "mart":
+            raise DplError(
+                f"витрина {named.name!r} не может быть источником:"
+                " у витрин нет зависимых спек",
+                pos=named.pos,
+                sqlstate=SqlState.INVALID_PARAMETER_VALUE,
             )
     await _check_source_cycle(cur, command)
     current = await _current_spec(
@@ -866,12 +927,11 @@ async def _create_build_spec(
     )
     await cur.executemany(
         "insert into datapulse.build_spec_mode"
-        " (version_id, dataset_code, build_spec_num, mode_code, type_code,"
-        "  is_clear)"
-        " values (%s, %s, %s, %s, %s, %s)",
+        " (version_id, dataset_code, build_spec_num, mode_code, type_code)"
+        " values (%s, %s, %s, %s, %s)",
         [
             (version_id, command.dataset_code, command.build_spec_num,
-             mode.mode_code, mode.type_code, mode.is_clear)
+             mode.mode_code, mode.type_code)
             for mode in command.modes
         ],
     )
@@ -904,8 +964,9 @@ async def _create_build_spec(
         await _create_spec_tables(
             cur, command.dataset_code, command.build_spec_num, attrs
         )
-    await _create_dataset_function(
-        cur, command.dataset_code, _attrs_as_dataset(attrs), live, dataset[2]
+    await _create_dataset_view(
+        cur, command.dataset_code, _attrs_as_dataset(attrs), live,
+        dataset[2], {attr[0]: attr[4] for attr in attrs},
     )
     return "CREATE BUILD_SPEC"
 
@@ -949,13 +1010,15 @@ async def _drop_build_spec(
         (version_id, command.dataset_code, command.build_spec_num,
          current[2], current[3], current[4], current[5]),
     )
+    # сначала вьюха без умирающей спеки (иначе drop таблиц упёрся бы в
+    # зависимость), потом физика; последняя спека умерла — заглушка
+    live = await _live_spec_nums(cur, command.dataset_code)
+    await _create_dataset_view(
+        cur, command.dataset_code, _attrs_as_dataset(attrs), live,
+        dataset[2], {attr[0]: attr[4] for attr in attrs},
+    )
     await _drop_spec_tables(
         cur, command.dataset_code, command.build_spec_num
-    )
-    live = await _live_spec_nums(cur, command.dataset_code)
-    # последняя спека умерла — функция откатывается на заглушку
-    await _create_dataset_function(
-        cur, command.dataset_code, _attrs_as_dataset(attrs), live, dataset[2]
     )
     return "DROP BUILD_SPEC"
 
@@ -974,7 +1037,8 @@ async def _bump_dataset(
     """Версия датасета бампится той же version_id, что и команда его
     спеки: копия dataset + dataset_attr (каждая версия самодостаточна)."""
     await _insert_dataset(
-        cur, version_id, dataset_code, is_deleted=False, descr=dataset[2]
+        cur, version_id, dataset_code,
+        type_code=dataset[3], is_deleted=False, descr=dataset[2],
     )
     await _insert_dataset_attrs(cur, version_id, dataset_code, attrs)
 
@@ -1088,6 +1152,70 @@ def _check_spec_head(command: CreateBuildSpec):
     return parallel_cnt, chunk_attr
 
 
+def _check_spec_modes(command: CreateBuildSpec, dataset_type: str) -> None:
+    """Режимная дисциплина по подклассу датасета.
+
+    Матрица типов переноса: store — init/incr/sect, mart — appd/init/skip.
+    Зарезервированные имена (их запускает поток, и только они двигают
+    окно дельты): initial — тип init; increment — incr|sect у store,
+    appd у mart; skip — только витрины. Прочие имена — ручные режимы.
+    Обязательность: store-спека несёт initial или increment (иначе
+    потоку нечего запускать); витринная — skip (иначе кран «скипаем»
+    не работает); витрина без initial/increment легальна — поток её
+    не считает, запуски только ручные.
+    """
+    allowed = (
+        STORE_TRANSFER_TYPES if dataset_type == "store"
+        else MART_TRANSFER_TYPES
+    )
+    increment_types = ("incr", "sect") if dataset_type == "store" else ("appd",)
+    names = {mode.mode_code for mode in command.modes}
+    for mode in command.modes:
+        if mode.type_code not in allowed:
+            raise DplError(
+                f"тип переноса {mode.type_code!r} недоступен"
+                f" {dataset_type}-спеке",
+                pos=mode.mode_pos,
+                hint=f"типы {dataset_type}: {', '.join(allowed)}",
+                sqlstate=SqlState.INVALID_PARAMETER_VALUE,
+            )
+        if mode.mode_code == "initial" and mode.type_code != "init":
+            raise DplError(
+                "режим initial обязан иметь тип init (полный пересчёт)",
+                pos=mode.mode_pos,
+                sqlstate=SqlState.INVALID_PARAMETER_VALUE,
+            )
+        if mode.mode_code == "increment" and mode.type_code not in increment_types:
+            raise DplError(
+                "режим increment обязан иметь тип "
+                + " | ".join(increment_types),
+                pos=mode.mode_pos,
+                sqlstate=SqlState.INVALID_PARAMETER_VALUE,
+            )
+        if mode.mode_code == "skip" and mode.type_code != "skip":
+            raise DplError(
+                "имя skip занято поглотителем дельты (голое SKIP в списке"
+                " режимов)",
+                pos=mode.mode_pos,
+                sqlstate=SqlState.INVALID_PARAMETER_VALUE,
+            )
+    if dataset_type == "store" and not names & {"initial", "increment"}:
+        raise DplError(
+            "store-спека обязана нести режим initial или increment —"
+            " иначе потоку нечего запускать",
+            pos=command.code_pos,
+            sqlstate=SqlState.INVALID_PARAMETER_VALUE,
+        )
+    if dataset_type == "mart" and "skip" not in names:
+        raise DplError(
+            "витринная спека обязана нести режим skip: без него кран"
+            " отгрузки «скипаем» не сможет сбросить накопленную дельту",
+            pos=command.code_pos,
+            hint="добавьте голое SKIP в список режимов",
+            sqlstate=SqlState.INVALID_PARAMETER_VALUE,
+        )
+
+
 async def _check_source_cycle(cur, command: CreateBuildSpec) -> None:
     """Ацикличность графа «датасет читает датасет» (по донору): рёбра
     живых спек каталога, спека команды — с новыми источниками."""
@@ -1174,10 +1302,10 @@ async def _comment_dataset(
     )
     await _insert_dataset(
         cur, version_id, command.dataset_code,
-        is_deleted=False, descr=command.comment,
+        type_code=current[3], is_deleted=False, descr=command.comment,
     )
     await _insert_dataset_attrs(cur, version_id, command.dataset_code, attrs)
-    await _comment_dataset_function(cur, command.dataset_code, command.comment)
+    await _comment_dataset_view(cur, command.dataset_code, command.comment)
     return "COMMENT"
 
 
@@ -1207,7 +1335,7 @@ async def _comment_attr(cur, command: CommentOnAttr, user_code: str, src: str) -
     )
     await _insert_dataset(
         cur, version_id, command.dataset_code,
-        is_deleted=False, descr=current[2],
+        type_code=current[3], is_deleted=False, descr=current[2],
     )
     await _insert_dataset_attrs(
         cur, version_id, command.dataset_code,
@@ -1217,8 +1345,12 @@ async def _comment_attr(cur, command: CommentOnAttr, user_code: str, src: str) -
             for attr_code, order_num, type_code, is_primary, descr in attrs
         ],
     )
-    # комментарий дублируется на колонки таблиц живых спек (на колонки
-    # результата функции его не положить — Postgres не умеет)
+    # комментарий дублируется на колонку вьюхи датасета и на колонки
+    # таблиц живых спек
+    await cur.execute(
+        f"comment on column {command.dataset_code}.{command.attr_name} is %s",
+        (command.comment,),
+    )
     for num in await _live_spec_nums(cur, command.dataset_code):
         for table in (
             _spec_table(command.dataset_code, num),
@@ -1296,10 +1428,18 @@ async def _create_connection(
             f"коннект {command.name!r} уже существует",
             pos=command.name_pos,
             sqlstate=SqlState.DUPLICATE_OBJECT,
-            hint=f"заменить — create or replace {command.class_code}",
+            hint=f"заменить — create or replace {command.class_code}"
+            " connection",
         )
-    # or replace может сменить класс — горячая замена источника;
-    # param_json пишется полностью по схеме нового класса
+    if alive and current[1] != command.class_code:
+        raise DplError(
+            f"коннект {command.name!r} — {current[1]}: смена класса через"
+            " or replace запрещена",
+            pos=command.name_pos,
+            hint="миграция источника на другой класс — новый коннект под"
+            " новым именем",
+            sqlstate=SqlState.FEATURE_NOT_SUPPORTED,
+        )
     encrypted = dict(params)
     for name in secret_fields(command.class_code):
         if name in encrypted:
@@ -1311,8 +1451,9 @@ async def _create_connection(
         cur, version_id,
         user_code=user_code,
         command=(
-            f"create or replace {command.class_code}" if command.or_replace
-            else f"create {command.class_code}"
+            f"create or replace {command.class_code} connection"
+            if command.or_replace
+            else f"create {command.class_code} connection"
         ),
         src=src,
         usage=usage,
@@ -1324,7 +1465,7 @@ async def _create_connection(
         " values (%s, %s, false, %s, %s)",
         (version_id, command.name, command.class_code, json.dumps(encrypted)),
     )
-    return f"CREATE {command.class_code.upper()}"
+    return "CREATE CONNECTION"
 
 
 async def _test_connection(cur, command: TestConnection, config: Config) -> str:
@@ -1397,6 +1538,93 @@ async def _probe_oracle(params: dict) -> None:
         await cur.fetchone()
     finally:
         await conn.close()
+
+
+# --- flow_spec --------------------------------------------------------------
+
+
+async def _current_flow_spec(
+    cur, name: str
+) -> tuple[bool, str | None, str] | None:
+    """Последняя версия пресета (is_deleted, descr, body); None — версий
+    не было."""
+    await cur.execute(
+        "select is_deleted, descr, body from datapulse.flow_spec"
+        " where flow_spec_code = %s order by version_id desc limit 1",
+        (name,),
+    )
+    return await cur.fetchone()
+
+
+async def _create_flow_spec(
+    cur, command: CreateFlowSpec, user_code: str, src: str
+) -> str:
+    """Пресет потока: тело — read-only SQL списка индивидуальных
+    запусков; исполняется и валидируется при запуске потока."""
+    if not command.body.strip():
+        raise DplError(
+            "тело пресета пустое",
+            pos=command.body_pos,
+            sqlstate=SqlState.INVALID_PARAMETER_VALUE,
+        )
+    last_version, usage, dp_descr = await _lock_catalog(cur)
+    current = await _current_flow_spec(cur, command.name)
+    alive = current is not None and not current[0]
+    if alive and not command.or_replace:
+        raise DplError(
+            f"пресет {command.name!r} уже существует",
+            pos=command.name_pos,
+            sqlstate=SqlState.DUPLICATE_OBJECT,
+            hint="заменить — create or replace flow_spec",
+        )
+    version_id = last_version + 1
+    await _insert_version(
+        cur, version_id,
+        user_code=user_code,
+        command="create or replace flow_spec" if command.or_replace
+        else "create flow_spec",
+        src=src,
+        usage=usage,
+        descr=dp_descr,
+    )
+    await cur.execute(
+        "insert into datapulse.flow_spec"
+        " (version_id, flow_spec_code, is_deleted, descr, body)"
+        " values (%s, %s, false, %s, %s)",
+        (version_id, command.name,
+         current[1] if alive else None, command.body),
+    )
+    return "CREATE FLOW_SPEC"
+
+
+async def _drop_flow_spec(
+    cur, command: DropFlowSpec, user_code: str, src: str
+) -> str:
+    last_version, usage, dp_descr = await _lock_catalog(cur)
+    current = await _current_flow_spec(cur, command.name)
+    if current is None or current[0]:
+        raise DplError(
+            f"пресет {command.name!r} не существует",
+            pos=command.name_pos,
+            sqlstate=SqlState.UNDEFINED_OBJECT,
+        )
+    version_id = last_version + 1
+    await _insert_version(
+        cur, version_id,
+        user_code=user_code,
+        command="drop flow_spec",
+        src=src,
+        usage=usage,
+        descr=dp_descr,
+    )
+    # tombstone: копия полей предыдущей версии
+    await cur.execute(
+        "insert into datapulse.flow_spec"
+        " (version_id, flow_spec_code, is_deleted, descr, body)"
+        " values (%s, %s, true, %s, %s)",
+        (version_id, command.name, current[1], current[2]),
+    )
+    return "DROP FLOW_SPEC"
 
 
 # --- python -----------------------------------------------------------------

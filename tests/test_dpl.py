@@ -13,12 +13,19 @@ from datapulse.dpl import (
     CreateConnection,
     CreateDatapulse,
     CreateDataset,
+    CreateFlowSpec,
     DatasetAttr,
     DplError,
     DropBuildSpec,
     DropDatapulse,
     DropDataset,
+    DropFlowSpec,
     FixCall,
+    FlowAttachCall,
+    FlowCall,
+    FlowPauseCall,
+    FlowResumeCall,
+    FlowStopCall,
     PythonBlock,
     SqlState,
     StopCall,
@@ -71,15 +78,17 @@ def test_drop():
     assert match_command("  drop datapulse ;") == DropDatapulse()
 
 
-# --- create [or replace] dataset -------------------------------------------
+# --- create [or replace] store|mart dataset ---------------------------------
 
 
-def test_create_dataset():
+def test_create_store_dataset():
     command = match_command(
-        "create dataset dm.dog (agreement_number text, open_date timestamp,"
-        " amount numeric(18,2), primary key (agreement_number))"
+        "create store dataset dm.dog (agreement_number text,"
+        " open_date timestamp, amount numeric(18,2),"
+        " primary key (agreement_number))"
     )
     assert isinstance(command, CreateDataset)
+    assert command.type_code == "store"
     assert command.dataset_code == "dm.dog"
     assert command.or_replace is False
     assert command.attrs == [
@@ -89,18 +98,19 @@ def test_create_dataset():
     ]
 
 
-def test_create_or_replace_dataset():
+def test_create_or_replace_mart_dataset():
     command = match_command(
-        "CREATE OR REPLACE DATASET stg.cat (x integer, primary key (x))"
+        "CREATE OR REPLACE MART DATASET stg.cat (x integer, primary key (x))"
     )
     assert isinstance(command, CreateDataset)
+    assert command.type_code == "mart"
     assert command.or_replace is True
     assert command.attrs == [DatasetAttr("x", "integer", True)]
 
 
 def test_create_dataset_composite_key_and_numeric_forms():
     command = match_command(
-        "create dataset dm.acct (a text, b numeric, c numeric(10),"
+        "create store dataset dm.acct (a text, b numeric, c numeric(10),"
         " d numeric(10,0), primary key (a, b))"
     )
     assert command.attrs == [
@@ -112,41 +122,51 @@ def test_create_dataset_composite_key_and_numeric_forms():
 
 
 def test_create_dataset_code_pos_is_global():
-    query = "/* x */ create dataset dm.dog (a text, primary key (a))"
+    query = "/* x */ create store dataset dm.dog (a text, primary key (a))"
     command = match_command(query)
     assert query[command.code_pos :].startswith("dm.dog")
+
+
+def test_create_dataset_requires_subclass():
+    with pytest.raises(DplError, match="обязателен подкласс"):
+        match_command("create dataset dm.dog (x text, primary key (x))")
 
 
 @pytest.mark.parametrize(
     "query, fragment",
     [
-        ("create dataset dog (x text, primary key (x))", "'.'"),
-        ("create dataset dm.dog2 (x text, primary key (x))", "цифрой"),
-        ("create dataset dm." + "a" * 51 + " (x text, primary key (x))",
-         "длиннее 50"),
-        ("create dataset dm.dog (x text)", "PRIMARY KEY обязателен"),
-        ("create dataset dm.dog (primary key (x), y text)", "последним"),
-        ("create dataset dm.dog (x text, primary key (x), primary key (x))",
-         "дважды"),
-        ("create dataset dm.dog (x text, y text, primary key (z))",
+        ("create store dataset dog (x text, primary key (x))", "'.'"),
+        ("create store dataset dm.dog2 (x text, primary key (x))", "цифрой"),
+        ("create store dataset dm." + "a" * 51
+         + " (x text, primary key (x))", "длиннее 50"),
+        ("create store dataset dm.dog (x text)", "PRIMARY KEY обязателен"),
+        ("create store dataset dm.dog (primary key (x), y text)",
+         "последним"),
+        ("create store dataset dm.dog (x text, primary key (x),"
+         " primary key (x))", "дважды"),
+        ("create store dataset dm.dog (x text, y text, primary key (z))",
          "не объявлен"),
-        ("create dataset dm.dog (x text, primary key (x, x))",
+        ("create store dataset dm.dog (x text, primary key (x, x))",
          "в ключе дважды"),
-        ("create dataset dm.dog (x text, x integer, primary key (x))",
+        ("create store dataset dm.dog (x text, x integer, primary key (x))",
          "объявлен дважды"),
-        ("create dataset dm.dog (build_id text, primary key (build_id))",
-         "служебной колонкой"),
-        ("create dataset dm.dog (select text, primary key (select))",
+        ("create store dataset dm.dog (build_id text,"
+         " primary key (build_id))", "служебной колонкой"),
+        ("create store dataset dm.dog (select text, primary key (select))",
          "ключевое слово"),
-        ("create dataset dm.dog (" + "a" * 64 + " text, primary key (x))",
-         "длиннее 63"),
-        ("create dataset dm.dog (x blob, primary key (x))", "неизвестный тип"),
-        ("create dataset dm.dog (x, primary key (x))", "тип атрибута"),
-        ("create dataset dm.dog (x numeric(0), primary key (x))", "точность"),
-        ("create dataset dm.dog (x numeric(5,6), primary key (x))", "масштаб"),
-        ("create dataset dm.dog (x text, primary key (x)) hvost",
+        ("create store dataset dm.dog (" + "a" * 64
+         + " text, primary key (x))", "длиннее 63"),
+        ("create store dataset dm.dog (x blob, primary key (x))",
+         "неизвестный тип"),
+        ("create store dataset dm.dog (x, primary key (x))", "тип атрибута"),
+        ("create store dataset dm.dog (x numeric(0), primary key (x))",
+         "точность"),
+        ("create store dataset dm.dog (x numeric(5,6), primary key (x))",
+         "масштаб"),
+        ("create store dataset dm.dog (x text, primary key (x)) hvost",
          "лишний текст"),
         ("create or replace datapulse (stg)", "неприменим"),
+        ("create mart dm.feed (x text, primary key (x))", "DATASET"),
     ],
 )
 def test_dataset_syntax_errors(query, fragment):
@@ -157,7 +177,7 @@ def test_dataset_syntax_errors(query, fragment):
 
 
 def test_dataset_error_position_is_global():
-    query = "  /* привет */  create dataset dm.dog (x text)"
+    query = "  /* привет */  create store dataset dm.dog (x text)"
     with pytest.raises(DplError) as exc_info:
         match_command(query)
     assert query[exc_info.value.pos :].startswith("dm.dog")
@@ -265,8 +285,9 @@ def test_comment_syntax_errors(query, fragment):
 def test_create_build_spec():
     command = match_command(
         "create or replace build_spec dm.dog.1 ("
-        "  clear init mode initial"
-        ", dirty incr mode manual"
+        "  init mode initial"
+        ", incr mode increment"
+        ", sect mode allegro"
         ") with (parallel = 16, chunk_attr = agreement_number)"
         "  using rbs, cft"
         "  as python $$ with rbs() as v_rbs: ... $$"
@@ -275,9 +296,10 @@ def test_create_build_spec():
     assert command.dataset_code == "dm.dog"
     assert command.build_spec_num == 1
     assert command.or_replace is True
-    assert [(m.mode_code, m.type_code, m.is_clear) for m in command.modes] == [
-        ("initial", "init", True),
-        ("manual", "incr", False),
+    assert [(m.mode_code, m.type_code) for m in command.modes] == [
+        ("initial", "init"),
+        ("increment", "incr"),
+        ("allegro", "sect"),
     ]
     assert {o.name: (o.value.kind, o.value.text) for o in command.options} == {
         "parallel": ("number", "16"),
@@ -290,7 +312,7 @@ def test_create_build_spec():
 
 def test_create_build_spec_from():
     command = match_command(
-        "create build_spec dm.dog.2 (dirty sect mode s)"
+        "create build_spec dm.dog.2 (incr mode increment)"
         " with (chunk_attr = x) from stg.a, ods.b as python $$x$$"
     )
     assert command.or_replace is False
@@ -298,9 +320,23 @@ def test_create_build_spec_from():
     assert [n.name for n in command.sources] == ["stg.a", "ods.b"]
 
 
+def test_create_build_spec_mart_using_and_from():
+    # витринная спека: from — сторы, using — коннекты отгрузки
+    command = match_command(
+        "create build_spec dm.feed.1 (appd mode increment, skip)"
+        " with (chunk_attr = x) using bki from dm.dog as python $$x$$"
+    )
+    assert [(m.mode_code, m.type_code) for m in command.modes] == [
+        ("increment", "appd"),
+        ("skip", "skip"),
+    ]
+    assert [n.name for n in command.using] == ["bki"]
+    assert [n.name for n in command.sources] == ["dm.dog"]
+
+
 def test_create_build_spec_generator():
     command = match_command(
-        "create build_spec dm.dog.3 (clear appd mode a)"
+        "create build_spec dm.dog.3 (init mode initial)"
         " with (chunk_attr = x) as python $$gen$$"
     )
     assert command.using == [] and command.sources == []
@@ -316,26 +352,23 @@ def test_drop_build_spec():
 @pytest.mark.parametrize(
     "query, fragment",
     [
-        ("create build_spec dm.dog (clear init mode m)"
+        ("create build_spec dm.dog (init mode m)"
          " with (chunk_attr = x) as python $$x$$", "'.'"),
-        ("create build_spec dm.dog.1 (clear init mode m) as python $$x$$", "WITH"),
-        ("create build_spec dm.dog.1 (clear init mode m)"
-         " with (chunk_attr = x) using a from b.c as python $$x$$",
-         "взаимоисключающи"),
-        ("create build_spec dm.dog.1 (clear init mode m)"
-         " with (chunk_attr = x)", "AS"),
-        ("create build_spec dm.dog.1 (clear init mode m)"
-         " with (chunk_attr = x) as $$x$$", "PYTHON"),
-        ("create build_spec dm.dog.1 (clear init mode m)"
-         " with (chunk_attr = x) as python 'тело'", "тело $$…$$"),
-        ("create build_spec dm.dog.1 (clear init mode m)"
-         " with (chunk_attr = x) as python $$незакрыто", "завершающего"),
-        ("create build_spec dm.dog.1 (clear foo mode m)"
-         " with (chunk_attr = x) as python $$x$$", "INCR"),
-        ("create build_spec dm.dog.1 (clear init m)"
-         " with (chunk_attr = x) as python $$x$$", "MODE"),
+        ("create build_spec dm.dog.1 (init mode m) as python $$x$$", "WITH"),
         ("create build_spec dm.dog.1 (init mode m)"
-         " with (chunk_attr = x) as python $$x$$", "CLEAR | DIRTY"),
+         " with (chunk_attr = x)", "AS"),
+        ("create build_spec dm.dog.1 (init mode m)"
+         " with (chunk_attr = x) as $$x$$", "PYTHON"),
+        ("create build_spec dm.dog.1 (init mode m)"
+         " with (chunk_attr = x) as python 'тело'", "тело $$…$$"),
+        ("create build_spec dm.dog.1 (init mode m)"
+         " with (chunk_attr = x) as python $$незакрыто", "завершающего"),
+        ("create build_spec dm.dog.1 (foo mode m)"
+         " with (chunk_attr = x) as python $$x$$", "INCR"),
+        ("create build_spec dm.dog.1 (init m)"
+         " with (chunk_attr = x) as python $$x$$", "MODE"),
+        ("create build_spec dm.dog.1 (skip mode s)"
+         " with (chunk_attr = x) as python $$x$$", "')'"),
         ("drop build_spec dm.dog", "'.'"),
         ("drop build_spec dm.dog.1 cascade", "лишний текст"),
     ],
@@ -347,13 +380,26 @@ def test_build_spec_syntax_errors(query, fragment):
     assert exc_info.value.sqlstate == SqlState.SYNTAX_ERROR
 
 
+def test_bare_skip_mode_declares_itself():
+    # skip в списке режимов — голое слово: имя фиксировано и равно типу;
+    # `skip mode имя` — ошибка (skip не читает MODE, дальше ждут ',' | ')')
+    command = match_command(
+        "create build_spec dm.feed.1 (skip, appd mode increment)"
+        " with (chunk_attr = x) as python $$x$$"
+    )
+    assert [(m.mode_code, m.type_code) for m in command.modes] == [
+        ("skip", "skip"),
+        ("increment", "appd"),
+    ]
+
+
 # --- alter datapulse --------------------------------------------------------
 
 
 def test_alter_datapulse_add():
-    command = match_command("ALTER DATAPULSE ADD mart ;")
+    command = match_command("ALTER DATAPULSE ADD extra ;")
     assert isinstance(command, AlterDatapulseAdd)
-    assert command.schema == "mart"
+    assert command.schema == "extra"
 
 
 @pytest.mark.parametrize(
@@ -364,7 +410,7 @@ def test_alter_datapulse_add():
         ("alter datapulse add", "имя схемы данных"),
         ("alter datapulse add public", "зарезервировано"),
         ("alter datapulse add " + "a" * 64, "длиннее 63"),
-        ("alter datapulse add mart, ods", "лишний текст"),
+        ("alter datapulse add extra, ods", "лишний текст"),
     ],
 )
 def test_alter_syntax_errors(query, fragment):
@@ -374,16 +420,16 @@ def test_alter_syntax_errors(query, fragment):
     assert exc_info.value.sqlstate == SqlState.SYNTAX_ERROR
 
 
-# --- create [or replace] *_connection / test --------------------------------
+# --- create [or replace] oracle|postgres connection / test ------------------
 
 
 def test_create_oracle_connection():
     command = match_command(
-        "create oracle_connection rbs with (host_name = 'db.rbs.ru',"
+        "create oracle connection rbs with (host_name = 'db.rbs.ru',"
         " service_name = 'RBS', user_name = 'ext', password = 'p''w')"
     )
     assert isinstance(command, CreateConnection)
-    assert command.class_code == "oracle_connection"
+    assert command.class_code == "oracle"
     assert command.name == "rbs"
     assert command.or_replace is False
     fields = {f.name: (f.value.kind, f.value.text) for f in command.fields}
@@ -397,15 +443,20 @@ def test_create_oracle_connection():
 
 def test_create_or_replace_postgres_connection():
     command = match_command(
-        "CREATE OR REPLACE postgres_connection wh WITH"
+        "CREATE OR REPLACE postgres CONNECTION wh WITH"
         " (host_name = 'h', port_num = 5433, database_name = 'd',"
         "  user_name = 'u', password = 'p')"
     )
     assert isinstance(command, CreateConnection)
-    assert command.class_code == "postgres_connection"
+    assert command.class_code == "postgres"
     assert command.or_replace is True
     port = next(f for f in command.fields if f.name == "port_num")
     assert (port.value.kind, port.value.text) == ("number", "5433")
+
+
+def test_create_connection_requires_class():
+    with pytest.raises(DplError, match="обязателен класс"):
+        match_command("create connection rbs with (host_name = 'h')")
 
 
 def test_test_connection():
@@ -417,15 +468,55 @@ def test_test_connection():
 @pytest.mark.parametrize(
     "query, fragment",
     [
-        ("create oracle_connection rbs (host_name = 'h')", "WITH"),
-        ("create oracle_connection rbs with ()", "поле коннекта"),
-        ("create oracle_connection rbs with (host_name 'h')", "'='"),
-        ("create oracle_connection rbs with (host_name = )", "значение"),
+        ("create oracle connection rbs (host_name = 'h')", "WITH"),
+        ("create oracle connection rbs with ()", "поле коннекта"),
+        ("create oracle connection rbs with (host_name 'h')", "'='"),
+        ("create oracle connection rbs with (host_name = )", "значение"),
+        ("create oracle rbs with (host_name = 'h')", "CONNECTION"),
         ("test", "имя коннекта"),
         ("test rbs x", "лишний текст"),
     ],
 )
 def test_connection_syntax_errors(query, fragment):
+    with pytest.raises(DplError) as exc_info:
+        match_command(query)
+    assert fragment in exc_info.value.message
+    assert exc_info.value.sqlstate == SqlState.SYNTAX_ERROR
+
+
+# --- create [or replace] / drop flow_spec -----------------------------------
+
+
+def test_create_flow_spec():
+    query = (
+        "create or replace flow_spec night as"
+        " $$ select 'dm.dog', 1, 'allegro' $$"
+    )
+    command = match_command(query)
+    assert isinstance(command, CreateFlowSpec)
+    assert command.name == "night"
+    assert command.or_replace is True
+    assert command.body == " select 'dm.dog', 1, 'allegro' "
+    assert query[command.body_pos :].startswith(" select")
+
+
+def test_drop_flow_spec():
+    command = match_command("drop flow_spec night")
+    assert isinstance(command, DropFlowSpec)
+    assert command.name == "night"
+
+
+@pytest.mark.parametrize(
+    "query, fragment",
+    [
+        ("create flow_spec as $$x$$", "AS"),
+        ("create flow_spec night $$x$$", "AS"),
+        ("create flow_spec night as 'x'", "тело $$…$$"),
+        ("create flow_spec night as $$x$$ y", "лишний текст"),
+        ("drop flow_spec", "имя пресета"),
+    ],
+)
+def test_flow_spec_syntax_errors(query, fragment):
     with pytest.raises(DplError) as exc_info:
         match_command(query)
     assert fragment in exc_info.value.message
@@ -478,7 +569,7 @@ def test_python_syntax_errors(query, fragment):
 def test_python_keyword_forbidden_as_attr():
     with pytest.raises(DplError, match="ключевое слово"):
         match_command(
-            "create dataset dm.dog (python text, primary key (python))"
+            "create store dataset dm.dog (python text, primary key (python))"
         )
 
 
@@ -528,11 +619,11 @@ def test_stop_and_fix_calls():
         ("build('dm.dog', 1, m)", "строкой"),
         ("build('dm.dog', 1, '1x')", "не идентификатор"),
         ("build('dm.dog', 1, 'm') x", "лишний текст"),
-        ("attach()", "номер билда"),
+        ("attach()", "номер (build_id)"),
         ("attach(42, x)", "позиция журнала"),
-        ("stop()", "номер билда"),
+        ("stop()", "номер (build_id)"),
         ("stop(42, 1)", "')'"),
-        ("fix('42')", "номер билда"),
+        ("fix('42')", "номер (build_id)"),
     ],
 )
 def test_build_call_syntax_errors(query, fragment):
@@ -544,6 +635,75 @@ def test_build_call_syntax_errors(query, fragment):
 
 def test_build_commands_are_routed():
     for query in ("build('dm.dog', 1, 'm')", "attach(1)", "stop(1)", "fix(1)"):
+        assert is_dpl_text(query)
+
+
+# --- flow / attach|stop|pause|resume flow -----------------------------------
+
+
+def test_flow_call_defaults():
+    command = match_command("flow()")
+    assert command == FlowCall(
+        flow_spec=None, spec_pos=5, intake_code="calc", export_code="calc"
+    )
+
+
+def test_flow_call_preset_and_valves():
+    command = match_command("flow('Night', intake = pass, export = skip)")
+    assert isinstance(command, FlowCall)
+    assert command.flow_spec == "night"
+    assert command.intake_code == "pass"
+    assert command.export_code == "skip"
+
+
+def test_flow_call_valves_only():
+    command = match_command("flow(export = pass)")
+    assert command.flow_spec is None
+    assert command.intake_code == "calc"
+    assert command.export_code == "pass"
+
+
+def test_flow_control_calls():
+    assert match_command("stop flow(7)") == FlowStopCall(flow_id=7, id_pos=10)
+    assert match_command("pause flow(7)") == FlowPauseCall(
+        flow_id=7, id_pos=11
+    )
+    assert match_command("resume flow(7)") == FlowResumeCall(
+        flow_id=7, id_pos=12
+    )
+    assert match_command("attach flow(7)") == FlowAttachCall(
+        flow_id=7, id_pos=12, from_log_id=0
+    )
+    command = match_command("attach flow(7, 500)")
+    assert (command.flow_id, command.from_log_id) == (7, 500)
+
+
+@pytest.mark.parametrize(
+    "query, fragment",
+    [
+        ("flow", "'('"),
+        ("flow('night' intake = pass)", "','"),
+        ("flow(intake = skip)", "CALC | PASS"),
+        ("flow(export = off)", "CALC | PASS | SKIP"),
+        ("flow(intake = pass, intake = calc)", "дважды"),
+        ("flow('ночь')", "не идентификатор"),
+        ("pause (7)", "FLOW"),
+        ("resume 7", "FLOW"),
+        ("stop flow()", "номер (flow_id)"),
+        ("attach flow(x)", "номер (flow_id)"),
+    ],
+)
+def test_flow_syntax_errors(query, fragment):
+    with pytest.raises(DplError) as exc_info:
+        match_command(query)
+    assert fragment in exc_info.value.message
+    assert exc_info.value.sqlstate == SqlState.SYNTAX_ERROR
+
+
+def test_flow_commands_are_routed():
+    for query in ("flow()", "stop flow(1)", "pause flow(1)",
+                  "resume flow(1)", "attach flow(1)",
+                  "create flow_spec f as $$x$$", "drop flow_spec f"):
         assert is_dpl_text(query)
 
 
@@ -588,18 +748,24 @@ def test_error_position_is_global():
     [
         ("create datapulse (x)", True),
         ("DROP DATAPULSE", True),
+        ("create store dataset dm.dog (x text, primary key (x))", True),
+        ("create or replace mart dataset dm.dog (x text, primary key (x))",
+         True),
         ("create dataset dm.dog (x text, primary key (x))", True),
-        ("create or replace dataset dm.dog (x text, primary key (x))", True),
         ("drop dataset dm.dog", True),
-        ("create build_spec dm.dog.1 (clear init mode m)"
+        ("create build_spec dm.dog.1 (init mode m)"
          " with (chunk_attr = x) as python $$x$$", True),
         ("drop build_spec dm.dog.1", True),
         ("comment on datapulse is 'x'", True),
         ("comment on dataset dm.dog is null", True),
         ("comment on attr dm.dog.x is 'x'", True),
-        ("create oracle_connection rbs with (host_name = 'h')", True),
+        ("create oracle connection rbs with (host_name = 'h')", True),
+        ("create flow_spec f as $$x$$", True),
         ("test rbs", True),
-        ("alter datapulse add mart", True),
+        ("alter datapulse add extra", True),
+        ("flow()", True),
+        ("pause flow(1)", True),
+        ("resume flow(1)", True),
         ("testing = off", False),
         ("alter table datapulse add column n int", False),
         ("create table t (n int)", False),

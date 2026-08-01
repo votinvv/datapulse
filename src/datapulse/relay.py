@@ -189,7 +189,7 @@ class RelaySession:
         run: commands.PythonRun | engine_mod.AttachRun | None = None
         if isinstance(command, dpl.PythonBlock):
             run = commands.PythonRun()
-        elif isinstance(command, dpl.AttachCall):
+        elif isinstance(command, (dpl.AttachCall, dpl.FlowAttachCall)):
             run = engine_mod.AttachRun()
         self.active_run = run
         try:

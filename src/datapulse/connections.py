@@ -20,8 +20,8 @@ class FieldSpec:
     secret: bool = False
 
 
-ORACLE_CONNECTION = "oracle_connection"
-POSTGRES_CONNECTION = "postgres_connection"
+ORACLE_CONNECTION = "oracle"
+POSTGRES_CONNECTION = "postgres"
 
 # имя занято коннектом на БД самой установки: его предоставляет
 # платформа инженерному коду (warehouse()), в каталоге он не хранится

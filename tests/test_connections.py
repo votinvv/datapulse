@@ -21,10 +21,10 @@ def _fields(query):
 
 def test_validate_params():
     fields = _fields(
-        "create oracle_connection c with (host_name = 'h', port_num = 1521,"
+        "create oracle connection c with (host_name = 'h', port_num = 1521,"
         " service_name = 's', user_name = 'u', password = 'p')"
     )
-    params = validate_params("oracle_connection", fields)
+    params = validate_params("oracle", fields)
     assert params == {
         "host_name": "h",
         "port_num": 1521,
@@ -37,11 +37,11 @@ def test_validate_params():
 def test_validate_params_port_required():
     # дефолтов у портов нет — обязательное поле (решение: явные порты)
     fields = _fields(
-        "create oracle_connection c with (host_name = 'h',"
+        "create oracle connection c with (host_name = 'h',"
         " service_name = 's', user_name = 'u', password = 'p')"
     )
     with pytest.raises(DplError, match="port_num"):
-        validate_params("oracle_connection", fields)
+        validate_params("oracle", fields)
 
 
 @pytest.mark.parametrize(
@@ -56,16 +56,16 @@ def test_validate_params_port_required():
     ],
 )
 def test_validate_params_errors(with_clause, fragment):
-    fields = _fields(f"create postgres_connection c with {with_clause}")
+    fields = _fields(f"create postgres connection c with {with_clause}")
     with pytest.raises(DplError) as exc_info:
-        validate_params("postgres_connection", fields)
+        validate_params("postgres", fields)
     assert fragment in exc_info.value.message
     assert exc_info.value.sqlstate == SqlState.INVALID_PARAMETER_VALUE
 
 
 def test_secret_fields():
-    assert secret_fields("oracle_connection") == {"password"}
-    assert secret_fields("postgres_connection") == {"password"}
+    assert secret_fields("oracle") == {"password"}
+    assert secret_fields("postgres") == {"password"}
 
 
 def test_secret_roundtrip():

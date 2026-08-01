@@ -77,8 +77,8 @@ def _oracle_factory(params: dict):
 
 
 _FACTORIES = {
-    "postgres_connection": _postgres_factory,
-    "oracle_connection": _oracle_factory,
+    "postgres": _postgres_factory,
+    "oracle": _oracle_factory,
 }
 
 

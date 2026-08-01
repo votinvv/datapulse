@@ -22,9 +22,12 @@ create table datapulse.version (
     constraint pk_version primary key (version_id)
 );
 
+-- датасет: подкласс — store (внутренний, срез сущностей) либо mart
+-- (витрина-выгрузка: терминальный, источником быть не может)
 create table datapulse.dataset (
     version_id    bigint   not null,
     dataset_code  text     not null,
+    type_code     text     not null,
     is_deleted    boolean  not null,
     descr         text,
     constraint pk_dataset primary key (dataset_code, version_id),
@@ -32,7 +35,9 @@ create table datapulse.dataset (
     constraint fk_dataset__version_id
         foreign key (version_id)
         references datapulse.version (version_id)
-        on delete cascade
+        on delete cascade,
+    constraint ck_dataset__type_code
+        check (type_code in ('store', 'mart'))
 );
 
 create table datapulse.dataset_attr (
@@ -82,13 +87,16 @@ create table datapulse.build_spec (
     constraint ck_build_spec__parallel_cnt check (parallel_cnt >= 1)
 );
 
+-- режим спеки: имя (адресация запуска) + тип переноса; зарезервированные
+-- имена initial/increment/skip двигают окно дельты («чистые»), прочие —
+-- ручные («грязные»); словарь имён и матрицу по подклассу датасета
+-- валидирует код команды
 create table datapulse.build_spec_mode (
     version_id      bigint   not null,
     dataset_code    text     not null,
     build_spec_num  integer  not null,
     mode_code       text     not null,
     type_code       text     not null,
-    is_clear        boolean  not null,
     constraint pk_build_spec_mode
         primary key (dataset_code, build_spec_num, version_id, mode_code),
     constraint fk_build_spec_mode__version_id
@@ -155,20 +163,87 @@ create table datapulse.connection (
         references datapulse.version (version_id)
         on delete cascade,
     constraint ck_connection__class_code
-        check (class_code in ('oracle_connection', 'postgres_connection'))
+        check (class_code in ('oracle', 'postgres'))
 );
 
+-- пресет потока: тело — read-only SQL, исполняется при запуске потока
+-- и возвращает список индивидуальных запусков (спека, режим)
+create table datapulse.flow_spec (
+    version_id      bigint   not null,
+    flow_spec_code  text     not null,
+    is_deleted      boolean  not null,
+    descr           text,
+    body            text     not null,
+    constraint pk_flow_spec primary key (flow_spec_code, version_id),
+    constraint uq_flow_spec__version_id unique (version_id),
+    constraint fk_flow_spec__version_id
+        foreign key (version_id)
+        references datapulse.version (version_id)
+        on delete cascade
+);
+
+-- поток: статика запуска волны по всему графу; ход и исход — в
+-- flow_log; текущее состояние — status_code последней строки журнала;
+-- flow_spec_code — по значению (журнал переживает версии каталога),
+-- NULL — запуск без пресета
+create table datapulse.flow (
+    version_id      bigint   not null,
+    flow_id         bigint   not null,
+    flow_spec_code  text,
+    user_code       text     not null,
+    intake_code     text     not null,
+    export_code     text     not null,
+    constraint pk_flow primary key (flow_id),
+    constraint fk_flow__version_id
+        foreign key (version_id)
+        references datapulse.version (version_id)
+        on delete cascade,
+    constraint ck_flow__intake_code
+        check (intake_code in ('calc', 'pass')),
+    constraint ck_flow__export_code
+        check (export_code in ('calc', 'pass', 'skip'))
+);
+
+-- журнал потока: статусы и ход дирижёра общим потоком; машина
+-- wait → exec ⇄ hold → done | stop (финалы; stop — остановлен вручную,
+-- его данные дотащит следующий поток)
+create table datapulse.flow_log (
+    version_id   bigint       not null,
+    flow_log_id  bigint       generated always as identity,
+    flow_id      bigint       not null,
+    log_time     timestamptz  not null,
+    status_code  text         not null,
+    message      text,
+    constraint pk_flow_log primary key (flow_log_id),
+    constraint fk_flow_log__version_id
+        foreign key (version_id)
+        references datapulse.version (version_id)
+        on delete cascade,
+    constraint fk_flow_log__flow_id
+        foreign key (flow_id)
+        references datapulse.flow (flow_id)
+        on delete cascade,
+    constraint ck_flow_log__status_code
+        check (status_code in ('wait', 'exec', 'hold', 'done', 'stop'))
+);
+
+create index ix_flow_log__flow_id
+    on datapulse.flow_log (flow_id, flow_log_id);
+
 -- билд: статика запуска; version_id — вотермарка версии метаданных;
--- ссылки на спеку — по значению, журнал переживает версии каталога
+-- ссылки на спеку и поток — по значению, журнал переживает версии
+-- каталога; flow_id NULL — межстримовый (ручной) билд; окно дельты не
+-- хранится — выводится из журнала (from — последний успешный билд
+-- чистого режима своей спеки, to — собственный build_id, у ручного
+-- витринного — граница последнего успешного потока)
 create table datapulse.build (
-    version_id       bigint   not null,
-    build_id         bigint   not null,
-    dataset_code     text     not null,
-    build_spec_num   integer  not null,
-    mode_code        text     not null,
-    is_clear         boolean  not null,
-    user_code        text     not null,
-    source_build_id  bigint,
+    version_id      bigint   not null,
+    build_id        bigint   not null,
+    flow_id         bigint,
+    dataset_code    text     not null,
+    build_spec_num  integer  not null,
+    mode_code       text     not null,
+    user_code       text     not null,
     constraint pk_build primary key (build_id),
     constraint fk_build__version_id
         foreign key (version_id)
@@ -178,6 +253,8 @@ create table datapulse.build (
 
 create index ix_build__dataset_code_build_spec_num
     on datapulse.build (dataset_code, build_spec_num, build_id);
+
+create index ix_build__flow_id on datapulse.build (flow_id, build_id);
 
 -- единый журнал билда: статусы и печать общим потоком;
 -- текущее состояние билда — status_code последней строки;

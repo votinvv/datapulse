@@ -1,8 +1,9 @@
 """DPL: распознавание, лексика и разбор команд платформы.
 
 Перехватываются только команды закрытого списка — create/drop/comment
-on над объектами платформы (datapulse, dataset, attr, коннекты), test
-и python — и только когда
+on над объектами платформы (datapulse, dataset, build_spec, flow_spec,
+attr, коннекты), test, python и команды запусков (build/flow с их
+управлением) — и только когда
 запрос — ровно один стейтмент; весь прочий трафик прокси пробрасывает в
 Postgres как есть. Сплиттер режет по `;` лексикой-надмножеством
 Postgres (кавычки, E-строки, dollar-quoting, вложенные блочные
@@ -212,13 +213,14 @@ _NUMBER_RE = re.compile(r"[0-9]+")
 # атрибутов датасета: имя, легальное сегодня, не должно сломаться завтра
 KEYWORDS = frozenset(
     """
-    create or replace drop clear comment on is null attr test alter add
-    datapulse dataset build_spec
-    oracle_connection postgres_connection
+    create or replace drop comment on is null attr test alter add
+    datapulse dataset build_spec flow_spec connection
+    store mart oracle postgres
     primary key with using from as mode
-    dirty init incr sect appd skip
+    init incr sect appd skip increment initial
+    intake export calc pass
     text integer bigint numeric boolean date timestamp timestamptz
-    select do python build attach stop fix
+    select do python build attach stop fix flow pause resume
     set reset show begin commit rollback
     """.split()
 )
@@ -319,6 +321,7 @@ class DatasetAttr:
 
 @dataclass(frozen=True)
 class CreateDataset:
+    type_code: str         # подкласс: 'store' | 'mart'
     dataset_code: str      # 'схема.имя'
     code_pos: int          # позиция кода датасета в тексте запроса
     or_replace: bool
@@ -372,7 +375,7 @@ class FieldAssign:
 
 @dataclass(frozen=True)
 class CreateConnection:
-    class_code: str        # oracle_connection | postgres_connection
+    class_code: str        # подкласс: 'oracle' | 'postgres'
     name: str
     name_pos: int
     or_replace: bool
@@ -419,7 +422,6 @@ class ModeDecl:
     mode_code: str
     mode_pos: int
     type_code: str     # init | incr | sect | appd | skip
-    is_clear: bool
 
 
 @dataclass(frozen=True)
@@ -480,6 +482,73 @@ class FixCall:
     id_pos: int
 
 
+@dataclass(frozen=True)
+class CreateFlowSpec:
+    """create [or replace] flow_spec имя as $$SQL$$ — пресет потока.
+
+    Тело — read-only SQL, исполняется при запуске потока и возвращает
+    список индивидуальных запусков (спека, режим).
+    """
+
+    name: str
+    name_pos: int
+    or_replace: bool
+    body: str
+    body_pos: int
+
+
+@dataclass(frozen=True)
+class DropFlowSpec:
+    name: str
+    name_pos: int
+
+
+@dataclass(frozen=True)
+class FlowCall:
+    """flow(['пресет'][, intake = calc|pass][, export = calc|pass|skip])
+    — асинхронный запуск потока (волны по всему графу)."""
+
+    flow_spec: str | None      # имя пресета; None — без пресета
+    spec_pos: int
+    intake_code: str           # кран приёма: calc | pass
+    export_code: str           # кран отгрузки: calc | pass | skip
+
+
+@dataclass(frozen=True)
+class FlowAttachCall:
+    """attach flow(flow_id [, позиция]) — живой хвост журнала потока."""
+
+    flow_id: int
+    id_pos: int
+    from_log_id: int
+
+
+@dataclass(frozen=True)
+class FlowStopCall:
+    """stop flow(flow_id) — остановить поток (пометка «остановлен
+    вручную»; его недоехавшие данные заберёт следующий поток)."""
+
+    flow_id: int
+    id_pos: int
+
+
+@dataclass(frozen=True)
+class FlowPauseCall:
+    """pause flow(flow_id) — пауза: новые билды не запускаются,
+    бегущий доезжает."""
+
+    flow_id: int
+    id_pos: int
+
+
+@dataclass(frozen=True)
+class FlowResumeCall:
+    """resume flow(flow_id) — снять паузу."""
+
+    flow_id: int
+    id_pos: int
+
+
 Command = (
     CreateDatapulse
     | DropDatapulse
@@ -498,12 +567,31 @@ Command = (
     | AttachCall
     | StopCall
     | FixCall
+    | CreateFlowSpec
+    | DropFlowSpec
+    | FlowCall
+    | FlowAttachCall
+    | FlowStopCall
+    | FlowPauseCall
+    | FlowResumeCall
 )
 
 IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 # имена, запрещённые как схемы данных
 RESERVED_SCHEMAS = frozenset({"datapulse", "public", "information_schema"})
+
+# подклассы датасета (прилагательное в create ... dataset)
+DATASET_TYPES = ("store", "mart")
+
+# зарезервированные имена режимов: их запускает поток, и только они
+# двигают окно дельты (skip — поглотитель); прочие имена — ручные
+# («грязные») режимы, окно не двигают
+WINDOW_MODES = ("initial", "increment", "skip")
+
+# матрица типов переноса по подклассу датасета
+STORE_TRANSFER_TYPES = ("init", "incr", "sect")
+MART_TRANSFER_TYPES = ("appd", "init", "skip")
 
 # служебные колонки SCD2 таблиц данных и функции датасета — заняты движком
 RESERVED_ATTRS = frozenset({"build_id", "end_build_id", "is_active"})
@@ -535,21 +623,26 @@ def _next_word(text: str, i: int) -> tuple[str | None, int]:
     return match.group(0).lower(), i
 
 
+# create [or replace]: объект либо подкласс-прилагательное перед ним;
+# голые dataset/connection тоже перехватываются — парсер даст честную
+# подсказку «укажите подкласс» вместо синтаксической ошибки Postgres
 _CREATE_OBJECTS = frozenset(
-    {"datapulse", "dataset", "build_spec",
-     "oracle_connection", "postgres_connection"}
+    {"datapulse", "dataset", "build_spec", "flow_spec", "connection",
+     "store", "mart", "oracle", "postgres"}
 )
-_DROP_OBJECTS = frozenset({"datapulse", "dataset", "build_spec"})
+_DROP_OBJECTS = frozenset({"datapulse", "dataset", "build_spec", "flow_spec"})
 _COMMENT_OBJECTS = frozenset({"datapulse", "dataset", "attr"})
 
 
 def _routed(text: str) -> bool:
     """Перехватывать ли стейтмент: create [or replace] | drop | comment on
-    над объектами платформы, а также test, python и команды билдов; всё
-    прочее (включая create or replace view/function, drop table,
-    comment on table … и анонимные блоки DO) уходит релеем."""
+    над объектами платформы, а также test, python и команды запусков
+    (build/flow и их управление); всё прочее (включая create or replace
+    view/function, drop table, comment on table … и анонимные блоки DO)
+    уходит релеем."""
     word, pos = _next_word(text, 0)
-    if word in ("test", "python", "build", "attach", "stop", "fix"):
+    if word in ("test", "python", "build", "attach", "stop", "fix",
+                "flow", "pause", "resume"):
         return True    # в словаре Postgres таких стейтментов нет
     if word == "alter":
         word2, _ = _next_word(text, pos + len(word))
@@ -683,7 +776,8 @@ class _Parser:
     def parse(self) -> Command:
         """Стейтмент уже прошёл маршрутизацию — глагол и объект известны."""
         if self.try_keyword("drop"):
-            obj = self.keyword("datapulse", "dataset", "build_spec")
+            obj = self.keyword("datapulse", "dataset", "build_spec",
+                               "flow_spec")
             if obj.value == "dataset":
                 schema, name = self.dataset_code()
                 self.finish()
@@ -697,6 +791,10 @@ class _Parser:
                 return DropBuildSpec(
                     dataset_code=code, build_spec_num=num, code_pos=pos
                 )
+            if obj.value == "flow_spec":
+                name = self.ident("имя пресета потока")
+                self.finish()
+                return DropFlowSpec(name=name.value, name_pos=name.pos)
             self.finish()
             return DropDatapulse()
         if self.try_keyword("comment"):
@@ -714,12 +812,24 @@ class _Parser:
             return PythonBlock(body=body.value, body_pos=body.pos)
         if self.try_keyword("build"):
             return self.build_call()
+        if self.try_keyword("flow"):
+            return self.flow_call()
         if self.try_keyword("attach"):
+            if self.try_keyword("flow"):
+                return FlowAttachCall(*self.id_with_position("flow_id"))
             return self.attach_call()
         if self.try_keyword("stop"):
-            return StopCall(*self.single_build_id())
+            if self.try_keyword("flow"):
+                return FlowStopCall(*self.single_id("flow_id"))
+            return StopCall(*self.single_id("build_id"))
         if self.try_keyword("fix"):
-            return FixCall(*self.single_build_id())
+            return FixCall(*self.single_id("build_id"))
+        if self.try_keyword("pause"):
+            self.keyword("flow")
+            return FlowPauseCall(*self.single_id("flow_id"))
+        if self.try_keyword("resume"):
+            self.keyword("flow")
+            return FlowResumeCall(*self.single_id("flow_id"))
         if self.try_keyword("alter"):
             self.keyword("datapulse")
             self.keyword("add")
@@ -732,17 +842,36 @@ class _Parser:
         if or_token:
             self.keyword("replace")
         obj = self.keyword(
-            "datapulse", "dataset", "build_spec",
-            "oracle_connection", "postgres_connection",
+            "datapulse", "dataset", "build_spec", "flow_spec", "connection",
+            "store", "mart", "oracle", "postgres",
         )
-        if obj.value == "dataset":
-            return self.create_dataset(or_replace=or_token is not None)
-        if obj.value == "build_spec":
-            return self.create_build_spec(or_replace=or_token is not None)
-        if obj.value in ("oracle_connection", "postgres_connection"):
+        if obj.value in DATASET_TYPES:
+            self.keyword("dataset")
+            return self.create_dataset(
+                type_code=obj.value, or_replace=or_token is not None
+            )
+        if obj.value in ("oracle", "postgres"):
+            self.keyword("connection")
             return self.create_connection(
                 class_code=obj.value, or_replace=or_token is not None
             )
+        if obj.value == "dataset":
+            raise DplError(
+                "у датасета обязателен подкласс: create store dataset"
+                " либо create mart dataset",
+                pos=obj.pos,
+                hint="store — внутренний датасет, mart — витрина-выгрузка",
+            )
+        if obj.value == "connection":
+            raise DplError(
+                "у коннекта обязателен класс: create oracle connection"
+                " либо create postgres connection",
+                pos=obj.pos,
+            )
+        if obj.value == "build_spec":
+            return self.create_build_spec(or_replace=or_token is not None)
+        if obj.value == "flow_spec":
+            return self.create_flow_spec(or_replace=or_token is not None)
         if or_token:
             raise DplError(
                 "OR REPLACE неприменим к datapulse",
@@ -826,7 +955,8 @@ class _Parser:
     # --- create [or replace] *_connection -----------------------------------
 
     def create_connection(self, class_code: str, or_replace: bool) -> CreateConnection:
-        """create [or replace] класс имя with ( поле = значение, … )"""
+        """create [or replace] oracle|postgres connection имя
+        with ( поле = значение, … )"""
         name = self.ident("имя коннекта")
         self.keyword("with")
         fields = self.assign_list("поле коннекта")
@@ -869,8 +999,12 @@ class _Parser:
     def create_build_spec(self, or_replace: bool) -> CreateBuildSpec:
         """create [or replace] build_spec схема.имя.номер
         ( режим [, …] ) with ( опция = значение [, …] )
-        [ using имя [, …] | from код_датасета [, …] ]
-        as python $$тело$$"""
+        [ using имя [, …] ] [ from код_датасета [, …] ]
+        as python $$тело$$
+
+        Совместимость using и from решает исполнение по подклассу
+        датасета: у store они взаимоисключающи, витрине можно оба
+        (from — сторы, using — коннекты отгрузки)."""
         code, num, pos = self.build_spec_ref()
         self.punct("(")
         modes = [self.mode_decl()]
@@ -883,13 +1017,7 @@ class _Parser:
         sources: list[Named] = []
         if self.try_keyword("using"):
             using = self.named_list("имя коннекта")
-        if from_token := self.try_keyword("from"):
-            if using:
-                raise DplError(
-                    "USING и FROM взаимоисключающи: спека — загрузчик либо"
-                    " трансформер",
-                    pos=from_token.pos,
-                )
+        if self.try_keyword("from"):
             sources = self.code_list()
         # обе секции отсутствуют — допустимо (спека-генератор)
         self.keyword("as")
@@ -913,16 +1041,19 @@ class _Parser:
         )
 
     def mode_decl(self) -> ModeDecl:
-        """`( clear | dirty ) тип_переноса mode имя`"""
-        clear_token = self.keyword("clear", "dirty")
+        """`тип_переноса MODE имя` | голое `skip` (имя skip-режима
+        фиксировано и совпадает с типом)."""
         transfer = self.keyword("init", "incr", "sect", "appd", "skip")
+        if transfer.value == "skip":
+            return ModeDecl(
+                mode_code="skip", mode_pos=transfer.pos, type_code="skip"
+            )
         self.keyword("mode")
         name = self.ident("имя режима")
         return ModeDecl(
             mode_code=name.value,
             mode_pos=name.pos,
             type_code=transfer.value,
-            is_clear=clear_token.value == "clear",
         )
 
     def named_list(self, what: str) -> list[Named]:
@@ -973,26 +1104,91 @@ class _Parser:
 
     def attach_call(self) -> AttachCall:
         """attach(build_id [, позиция build_log_id])"""
-        self.punct("(")
-        build_id = self.number("номер билда (build_id)")
-        from_log_id = 0
-        if self.try_punct(","):
-            from_log_id = int(self.number("позиция журнала (build_log_id)").value)
-        self.punct(")")
-        self.finish()
+        build_id, id_pos, from_log_id = self.id_with_position("build_id")
         return AttachCall(
-            build_id=int(build_id.value),
-            id_pos=build_id.pos,
-            from_log_id=from_log_id,
+            build_id=build_id, id_pos=id_pos, from_log_id=from_log_id
         )
 
-    def single_build_id(self) -> tuple[int, int]:
-        """`( build_id )` — общий хвост stop и fix."""
+    def id_with_position(self, what: str) -> tuple[int, int, int]:
+        """`( id [, позиция журнала] )` — хвост attach обоих адресатов."""
         self.punct("(")
-        build_id = self.number("номер билда (build_id)")
+        target = self.number(f"номер ({what})")
+        from_log_id = 0
+        if self.try_punct(","):
+            from_log_id = int(self.number("позиция журнала").value)
         self.punct(")")
         self.finish()
-        return int(build_id.value), build_id.pos
+        return int(target.value), target.pos, from_log_id
+
+    def single_id(self, what: str) -> tuple[int, int]:
+        """`( id )` — общий хвост stop, fix, pause, resume."""
+        self.punct("(")
+        target = self.number(f"номер ({what})")
+        self.punct(")")
+        self.finish()
+        return int(target.value), target.pos
+
+    def flow_call(self) -> FlowCall:
+        """flow([ 'пресет' ][, intake = calc|pass]
+        [, export = calc|pass|skip]) — запуск потока."""
+        self.punct("(")
+        flow_spec = None
+        spec_pos = self.peek().pos
+        options: dict[str, str] = {}
+        first = True
+        while not self.at_punct(")"):
+            if not first:
+                self.punct(",")
+            token = self.peek()
+            if first and token.kind is TokKind.STRING:
+                self.advance()
+                flow_spec = token.value.strip().lower()
+                spec_pos = token.pos
+                if not IDENT_RE.fullmatch(flow_spec):
+                    raise DplError(
+                        f"имя пресета {token.value!r} — не идентификатор",
+                        pos=token.pos,
+                    )
+            else:
+                name = self.keyword("intake", "export")
+                self.punct("=")
+                if name.value == "intake":
+                    value = self.keyword("calc", "pass")
+                else:
+                    value = self.keyword("calc", "pass", "skip")
+                if name.value in options:
+                    raise DplError(
+                        f"кран {name.value!r} задан дважды", pos=name.pos
+                    )
+                options[name.value] = value.value
+            first = False
+        self.punct(")")
+        self.finish()
+        return FlowCall(
+            flow_spec=flow_spec,
+            spec_pos=spec_pos,
+            intake_code=options.get("intake", "calc"),
+            export_code=options.get("export", "calc"),
+        )
+
+    def create_flow_spec(self, or_replace: bool) -> CreateFlowSpec:
+        """create [or replace] flow_spec имя as $$SQL$$"""
+        name = self.ident("имя пресета потока")
+        if len(name.value) > 63:
+            raise DplError("имя пресета длиннее 63 символов", pos=name.pos)
+        self.keyword("as")
+        body = self.peek()
+        if body.kind is not TokKind.BODY:
+            raise self.error("тело $$…$$ (SQL списка запусков)")
+        self.advance()
+        self.finish()
+        return CreateFlowSpec(
+            name=name.value,
+            name_pos=name.pos,
+            or_replace=or_replace,
+            body=body.value,
+            body_pos=body.pos,
+        )
 
     # --- dataset ------------------------------------------------------------
 
@@ -1012,8 +1208,8 @@ class _Parser:
         num = self.number("номер спеки")
         return f"{schema.value}.{name.value}", int(num.value), schema.pos
 
-    def create_dataset(self, or_replace: bool) -> CreateDataset:
-        """create [or replace] dataset схема.имя
+    def create_dataset(self, type_code: str, or_replace: bool) -> CreateDataset:
+        """create [or replace] store|mart dataset схема.имя
         ( атрибут тип [, …], primary key ( имя [, …] ) )"""
         schema, name = self.dataset_code()
         _check_dataset_name(name.value, name.pos)
@@ -1047,7 +1243,9 @@ class _Parser:
                 " SCD2-семантики",
                 pos=schema.pos,
             )
-        return _build_create_dataset(schema, name, or_replace, attrs, primary_key)
+        return _build_create_dataset(
+            type_code, schema, name, or_replace, attrs, primary_key
+        )
 
     def attr_decl(self) -> tuple[Token, str]:
         """`имя тип`; проверки имени и параметров numeric — сразу."""
@@ -1103,6 +1301,7 @@ class _Parser:
 
 
 def _build_create_dataset(
+    type_code: str,
     schema: Token,
     name: Token,
     or_replace: bool,
@@ -1126,12 +1325,13 @@ def _build_create_dataset(
             raise DplError(f"атрибут {token.value!r} в ключе дважды", pos=token.pos)
         pk_names.add(token.value)
     return CreateDataset(
+        type_code=type_code,
         dataset_code=f"{schema.value}.{name.value}",
         code_pos=schema.pos,
         or_replace=or_replace,
         attrs=[
-            DatasetAttr(token.value, type_code, token.value in pk_names)
-            for token, type_code in attrs
+            DatasetAttr(token.value, attr_type, token.value in pk_names)
+            for token, attr_type in attrs
         ],
     )
 
